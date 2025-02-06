@@ -1,0 +1,8 @@
+{
+  "tasks": {
+    "find-urls": "deno run --allow-env --env-file --allow-read --allow-write --allow-run --allow-net find-urls.ts"
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@1"
+  }
+}
