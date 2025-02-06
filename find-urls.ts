@@ -1,13 +1,33 @@
-import { assert } from "https://deno.land/std@0.93.0/_util/assert.ts";
-import puppeteer, { HTTPRequest, Page } from 'https://deno.land/x/puppeteer@16.2.0/mod.ts'
+import { assert } from 'jsr:@std/assert/assert'
+import puppeteer, { HTTPRequest, HTTPResponse, Page } from 'https://deno.land/x/puppeteer@16.2.0/mod.ts'
 
 const COOKIE_FILE = './cookies.json'
 
 if (import.meta.main) {
-    await main(Deno.args)
+    const ffmpegPath = Deno.env.get('FFmpeg_path')
+    const storageRoot = Deno.env.get('Storage_root')
+    console.log({
+        ffmpegPath,
+        storageRoot,
+    })
+    if (!ffmpegPath) {
+        console.log('FFmpeg_path not set.')
+        Deno.exit(1)
+    }
+    if (!storageRoot) {
+        console.log('Storage_root not set.')
+        Deno.exit(1)
+    }
+
+    await main({
+        args: Deno.args,
+    })
 }
 
-async function main(args: string[]) {
+type mainParams = {
+    args: string[]
+}
+async function main({ args }: mainParams) {
     const urls = args
     if (urls.length === 0) {
         console.log('No URLs provided.')
@@ -24,7 +44,88 @@ async function main(args: string[]) {
         loginUrl: loginUrl!,
         loggedInSelector: loggedInSelector!,
     }
-    await process({ urls, loginParams, cdnIdentifier, })
+
+    if (urls[0].startsWith('http')) {
+        await findVideo({ urls, loginParams, cdnIdentifier, })
+    } else {
+        await downloadFolder({ folder: urls[0] })
+    }
+}
+
+type downloadFolderParams = {
+    folder: string
+}
+async function downloadFolder({ folder }: downloadFolderParams) {
+    const infoText = await Deno.readTextFile(`./${folder}/info.json`)
+    const info = JSON.parse(infoText)
+    const { title, m3u8 }: { title: string, m3u8: string[], } = info
+
+    console.log({ title })
+    for (const m of m3u8) {
+        const m3u8File = m.split('/').pop()!
+        const m3u8Base = m.split('/').slice(0, -1).join('/')
+        const m3u8Text = await Deno.readTextFile(`./${folder}/${m3u8File}`)
+
+        const lines = m3u8Text.split(/\r?\n/)
+        const videoSegments = lines
+            .filter((line) => !line.startsWith('#'))
+            .filter((line) => line.endsWith('.ts'))
+        const keyLine = lines.find((line) => line.startsWith('#EXT-X-KEY:'))
+        const keyUri = keyLine?.match(/URI="([^"]+)"/)?.[1]
+
+        const downloadSegments = [keyUri, ...videoSegments]
+
+        const promises: Promise<void>[] = []
+        for (const segment of downloadSegments) {
+            const segmentPath = `./${folder}/${segment}`
+            const segmentUrl = `${m3u8Base}/${segment}`
+
+            if (await Deno.stat(segmentPath).catch(() => null)) {
+                console.log(`Skipping ${segment}...`)
+                continue
+            }
+
+            console.log(`Downloading ${segment}...`)
+            promises.push((async () => {
+                const segmentResponse = await fetch(segmentUrl)
+                const segmentBuffer = await segmentResponse.arrayBuffer()
+                await Deno.writeFile(segmentPath, new Uint8Array(segmentBuffer))
+                console.log(`Completed ${segment}...`)
+            })())
+        }
+        await Promise.all(promises)
+    }
+}
+
+type findVideoParams = {
+    urls: string[]
+    loginParams: getLoggedInPageParams
+    cdnIdentifier: string
+}
+async function findVideo({ urls, loginParams, cdnIdentifier, }: findVideoParams) {
+    const results = await process({ urls, loginParams, cdnIdentifier, })
+    for (const result of results) {
+        const titleFolder = result.title.replace(/[^a-z0-9]/gi, '-').toLowerCase()
+        console.log(`Writing to ${titleFolder}...`)
+        await Deno.mkdir(`./${titleFolder}`, { recursive: true })
+
+        const info = {
+            pageUrl: result.url,
+            title: result.title,
+            m3u8: result.m3u8.map(([ url, _ ]) => url),
+        }
+        const infoText = JSON.stringify(info, null, 2)
+        await Deno.writeTextFile(`./${titleFolder}/info.json`, infoText)
+        for (const [ url, body ] of result.m3u8) {
+            const m3u8File = url.split('/').pop()!
+            await Deno.writeTextFile(`./${titleFolder}/${m3u8File}`, body)
+        }
+    }
+    console.log({ results: results.map(({ m3u8, ...rest }) => ({
+        ...rest,
+        m3u8Url: m3u8.map(([ url, _ ]) => url),
+        m3u8BodyLength: m3u8.map(([ _, body ]) => body.length),
+    })) })
 }
 
 type processParams = {
@@ -42,14 +143,15 @@ async function process({
     const results: {
         url: string,
         title: string,
-        m3u8Urls: string[],
+        m3u8: [url: string, body: string][],
     }[] = []
     for (const url of urls) {
-        const result = await getIFrameM3u8Urls({ page, url, cdnIdentifier, })
-        results.push({ url, ...result, })
+        const { title, m3u8Body, } = await getIFrameM3u8Urls({ page, url, cdnIdentifier, })
+        results.push({ url, title, m3u8: m3u8Body, })
     }
 
     await browser.close();
+    return results
 }
 
 async function loadCookies(page: Page) {
@@ -82,7 +184,9 @@ async function getLoggedInPage({
         executablePath: `C:/Program Files/Google/Chrome/Application/chrome.exe`,
         headless: false,
     })
+
     const page = await browser.newPage()
+    page.setViewport({ width: 1024, height: 768, })
 
     const loadedCookies = await loadCookies(page)
     if (!loadedCookies) {
@@ -112,15 +216,16 @@ async function getIFrameM3u8Urls({
     url,
     cdnIdentifier,
 }: getIFrameM3u8UrlsParams) {
-    const m3u8Urls: string[] = []
-    const cdnSites: string[] = []
+    const m3u8Body: [url: string, body: string][] = []
+    let m3u8Urls: string[] = []
+    let cdnSites: string[] = []
 
     const ignorePrefixes = new Map<string, number>()
-    for (const ignore of ['data:image']) {
+    for (const ignore of ['blob:https', 'data:application/font-woff', 'data:image']) {
         ignorePrefixes.set(ignore, 0)
     }
     const ignoreExtensions = new Map<string, number>()
-    for (const ignore of ['.css', '.jpg', '.js', '.php', '.png', '.woff2']) {
+    for (const ignore of ['.css', '.jpg', '.js', '.key', '.php', '.png', '.ts', '.woff2']) {
         ignoreExtensions.set(ignore, 0)
     }
     const collectRequests = (eventName: string) => (event: HTTPRequest) => {
@@ -154,6 +259,18 @@ async function getIFrameM3u8Urls({
             console.log(`ignored ${eventName}:${request.resourceType()}:[${frame?.url()}] → ${url}`)
         }
     }
+    const collectResponse = (event: HTTPResponse) => {
+        if (event.status() !== 200) { return }
+
+        const request = event.request()
+        if (request.resourceType() !== 'xhr') { return }
+        if (!event.url().endsWith('.m3u8')) { return }
+        
+        (async () => {
+            const body = await event.text()
+            m3u8Body.push([event.url(), body])
+        })()
+    }
 
     const events = [
         ['request', collectRequests('request')],
@@ -165,11 +282,7 @@ async function getIFrameM3u8Urls({
     for (const [ eventName, handler ] of events) {
         page.on(eventName, handler)
     }
-
-    page.on('request', collectRequests('request'))
-    page.on('requestfinished', collectRequests('requestfinished'))
-    page.on('requestfailed', collectRequests('requestfailed'))
-    page.on('requestservedfromcache', collectRequests('requestservedfromcache'))
+    page.on('response', collectResponse)
 
     page.goto(url)
 
@@ -199,6 +312,13 @@ async function getIFrameM3u8Urls({
                 promise: 'timeout:5000',
             })),
     ])
+
+    m3u8Urls = Array.from(new Set(m3u8Urls))
+    cdnSites = Array.from(new Set(cdnSites))
+
+    console.log({
+        m3u8Body,
+    })
     console.log({ promiseResult })
     console.log({
         m3u8Urls,
@@ -210,19 +330,18 @@ async function getIFrameM3u8Urls({
     for (const [ eventName, handler ] of events) {
         page.off(eventName, handler)
     }
+    page.off('response', collectResponse)
 
     const title = await page.title()
 
-    const uniqueCdnSites = Array.from(new Set(cdnSites))
-    for (let i = 0; i < uniqueCdnSites.length && m3u8Urls.length === 0; i++) {
-        const cdnSite = uniqueCdnSites[i]
+    for (let i = 0; i < cdnSites.length && m3u8Urls.length === 0; i++) {
+        const cdnSite = cdnSites[i]
         console.log(`++++ Trying to find m3u8 URLs from ${cdnSite}`)
         const results = await getIFrameM3u8Urls({ page, url: cdnSite, cdnIdentifier, })
-        m3u8Urls.push(...results.m3u8Urls)
+        m3u8Body.push(...results.m3u8Body)
     }
     return {
         title,
-        m3u8Urls,
-        cdnSites,
+        m3u8Body,
     }
 }
