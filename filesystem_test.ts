@@ -1,5 +1,5 @@
 import { getFileSafeName } from "./filesystem.ts"
-import { assertEquals } from '@std/assert/equals'
+import { assertEquals } from 'jsr:@std/assert/equals'
 
 Deno.test(function testReplaceFileChars() {
     const name = 'folder:name/with\\invalid*chars?"here<and>here|'
